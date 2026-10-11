@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { getChatGPTUser } from "../../chatgpt-auth";
+import {validateResult,reviewProposal} from "../../../lib/fight-results";
 const classes = ["Strawweight","Flyweight","Bantamweight","Featherweight","Lightweight","Welterweight","Middleweight","Light Heavyweight","Heavyweight"];
 export async function GET(){
  const auth=await getChatGPTUser(); if(!auth) return Response.json({signedIn:false});
@@ -29,7 +30,7 @@ export async function POST(req:Request){
  await db.prepare('INSERT INTO nights (id,host,guest,status,data,created) VALUES (?,?,?,?,?,?)').bind(crypto.randomUUID(),id,guest.id,'invited',JSON.stringify({fights:[],picks:{},phase:'setup'}),new Date().toISOString()).run();
  }else{
  const n:any=await db.prepare('SELECT * FROM nights WHERE id=?').bind(b.night).first();if(!n||![n.host,n.guest].includes(id))throw Error('Fight night not found.');
- let data=JSON.parse(n.data),status=n.status;
+ let data=JSON.parse(n.data),status=n.status;const newKeys:string[]=[];
  if(b.action==='accept'||b.action==='decline'){if(id!==n.guest||status!=='invited')throw Error('Invitation unavailable.');status=b.action==='accept'?'active':'declined';}
  else if(status!=='active')throw Error('This fight night is not active.');
  else if(b.action==='pick'){
@@ -38,14 +39,23 @@ export async function POST(req:Request){
  const other=data.picks[id===n.host?n.guest:n.host];if(other&&other.weight!==b.weight)throw Error('Both fighters must use the same weight class.');
  data.picks[id]={fighter,weight:b.weight};if(data.picks[n.host]&&data.picks[n.guest])data.phase='live';
  }else if(b.action==='result'){
- if(data.phase!=='live')throw Error('This result has already been recorded or fighters are not ready.');
- if(![n.host,n.guest].includes(b.winner)||!['TKO','Submission','Decision'].includes(b.method)||![3,5].includes(Number(b.rounds)))throw Error('Choose a winner and result.');
- const round=Number(b.round),seconds=Number(b.seconds);if(!Number.isInteger(round)||round<1||round>Number(b.rounds)||!Number.isInteger(seconds)||seconds<0||seconds>300)throw Error('Enter a valid round and time (0:00–5:00).');
- if(b.method==='Decision'&&(round!==Number(b.rounds)||seconds!==300))throw Error('A decision must be at the end of the final round.');
- data.fights.push({id:crypto.randomUUID(),picks:data.picks,winner:b.winner,method:b.method,round,seconds,weight:data.picks[n.host].weight});data.phase='recorded';
- }else if(b.action==='next'){if(data.phase!=='recorded')throw Error('Record this fight first.');data.picks={};data.phase='setup';}
+ if(data.phase!=='live')throw Error('Record unavailable: another result is already pending or the fight has not started.');
+ const result=validateResult(b,n);
+ const knownPhotos=(data.draft?.photos||[]) as string[];
+ for(let i=0;i<result.photos.length;i++){
+ const photo=result.photos[i];
+ if(photo.startsWith('/api/')){if(!knownPhotos.includes(photo))throw Error('Photo does not belong to this fight.');continue;}
+ if(!env.BUCKET)throw Error('Photo storage is unavailable. You can submit manually without photos.');
+ const key=crypto.randomUUID();await env.BUCKET.put(key,Uint8Array.from(atob(photo.split(',')[1]),c=>c.charCodeAt(0)),{httpMetadata:{contentType:'image/jpeg'}});newKeys.push(key);
+ result.photos[i]=`/api/evidence?night=${encodeURIComponent(n.id)}&key=${key}`;
+ }
+
+ data.pending={...result,id:crypto.randomUUID(),picks:data.picks,weight:data.picks[n.host].weight,submittedBy:id,submittedAt:new Date().toISOString()};data.phase='review';delete data.correction;
+ }else if(['confirm','request_changes','withdraw'].includes(b.action)){
+ data=reviewProposal(data,id,b.action,b.pendingId,String(b.note||''));
+ }else if(b.action==='next'){if(data.phase!=='recorded')throw Error('Record this fight first.');data.picks={};delete data.draft;delete data.correction;data.phase='setup';}
  else if(b.action==='end'){if(data.phase!=='recorded')throw Error('Record the fight before ending the night.');status='ended';}else throw Error('Unknown action.');
- const r=await db.prepare('UPDATE nights SET status=?,data=? WHERE id=? AND data=? AND status=?').bind(status,JSON.stringify(data),n.id,n.data,n.status).run();if(!r.meta.changes)throw Error('Your friend updated this night. Refresh and try again.');
+ const r=await db.prepare('UPDATE nights SET status=?,data=? WHERE id=? AND data=? AND status=?').bind(status,JSON.stringify(data),n.id,n.data,n.status).run();if(!r.meta.changes){if(newKeys.length&&env.BUCKET)await env.BUCKET.delete(newKeys);throw Error('Your friend updated this night. Refresh and try again.');}
  }
  }
  return Response.json({ok:true});
